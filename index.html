@@ -12,6 +12,8 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Heebo:wght@400;700;900&family=Anton&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/flag-icons/7.2.3/css/flag-icons.min.css">
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
 <style>
   body { margin: 0; background: #000; font-family: 'Heebo', sans-serif; }
   .display-font { font-family: 'Anton', 'Bebas Neue', sans-serif; letter-spacing: 0.02em; }
@@ -74,9 +76,24 @@
 const { useState, useEffect } = React;
 
 // ============== CLOUD STORAGE CONFIG ==============
-// JSONBin master key for shared cloud storage
-const JSONBIN_MASTER_KEY = '$2a$10$Cvlv0hEGbc5L20vdFXDSxuuUNUpZIjxFtp.o4BmPDzb06mzQX0P8S';
-const STORAGE_BIN_KEY = 'mondial2026_bin_id'; // localStorage key for the bin id
+// Firebase Realtime Database - free, unlimited, reliable
+const firebaseConfig = {
+  apiKey: "AIzaSyD8qF-6aDCs4lVI5lWJk1EdjQRldCh1XV4",
+  authDomain: "mondial-2026-67885.firebaseapp.com",
+  databaseURL: "https://mondial-2026-67885-default-rtdb.firebaseio.com",
+  projectId: "mondial-2026-67885",
+  storageBucket: "mondial-2026-67885.firebasestorage.app",
+  messagingSenderId: "644197853468",
+  appId: "1:644197853468:web:1afe88da00a5e3c27df2d9"
+};
+
+// Initialize Firebase
+try {
+  firebase.initializeApp(firebaseConfig);
+} catch (e) {
+  console.log('Firebase already initialized');
+}
+const fbDB = firebase.database();
 
 // Admin password (change in code if you want)
 const ADMIN_PASSWORD = 'tzahi-master-2026';
@@ -306,69 +323,91 @@ function formatMatchDate(utc) {
 // HARDCODED BIN ID - SAME FOR ALL USERS (central shared storage)
 let CLOUD_BIN_ID = '6a003c8fc0954111d800cfa9';
 
-const JSONBIN_BASE = 'https://api.jsonbin.io/v3/b';
-const headers = () => ({
-  'Content-Type': 'application/json',
-  'X-Master-Key': JSONBIN_MASTER_KEY,
-  'X-Access-Key': JSONBIN_MASTER_KEY,
-});
+// ============== FIREBASE CLOUD FUNCTIONS ==============
+// Local backup for resilience
+const LOCAL_BACKUP_KEY = 'mondial2026_backup';
 
-async function ensureBin() {
-  // Always use the hardcoded central Bin ID - all users share this single storage
-  return CLOUD_BIN_ID;
+function saveLocalBackup(data) {
+  try { localStorage.setItem(LOCAL_BACKUP_KEY, JSON.stringify(data)); } catch {}
+}
+
+function loadLocalBackup() {
+  try {
+    const raw = localStorage.getItem(LOCAL_BACKUP_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return null;
 }
 
 async function cloudGetAll() {
-  const id = await ensureBin();
-  if (!id) return { submissions: [], results: {} };
   try {
-    const r = await fetch(`${JSONBIN_BASE}/${id}/latest`, { headers: headers() });
-    const data = await r.json();
-    const subs = data?.record?.submissions || [];
-    const results = data?.record?.results || {};
-    const sorted = Array.isArray(subs) ? subs.sort((a,b) => (b.submittedAt||0) - (a.submittedAt||0)) : [];
-    return { submissions: sorted, results };
+    const snapshot = await fbDB.ref('/').once('value');
+    const data = snapshot.val() || {};
+    const submissions = data.submissions ? Object.values(data.submissions) : [];
+    const results = data.results || {};
+    const sorted = submissions.sort((a,b) => (b.submittedAt||0) - (a.submittedAt||0));
+    const result = { submissions: sorted, results };
+    saveLocalBackup(result);
+    return result;
   } catch (e) {
-    console.error('cloudGetAll failed', e);
+    console.error('cloudGetAll failed, trying local backup', e);
+    const backup = loadLocalBackup();
+    if (backup) return backup;
     return { submissions: [], results: {} };
   }
 }
 
-async function cloudSetAll(submissions, results) {
-  const id = await ensureBin();
-  if (!id) throw new Error('no bin');
-  const r = await fetch(`${JSONBIN_BASE}/${id}`, {
-    method: 'PUT',
-    headers: headers(),
-    body: JSON.stringify({ submissions, results: results || {} }),
-  });
-  if (!r.ok) throw new Error('save failed');
-  return r.json();
-}
-
 async function cloudAddSubmission(sub) {
-  const data = await cloudGetAll();
-  // Prevent duplicate by id
-  const existing = data.submissions.findIndex(s => s.id === sub.id);
-  if (existing >= 0) data.submissions[existing] = sub;
-  else data.submissions.unshift(sub);
-  await cloudSetAll(data.submissions, data.results);
+  try {
+    await fbDB.ref(`/submissions/${sub.id}`).set(sub);
+    const data = await cloudGetAll();
+    saveLocalBackup(data);
+    return true;
+  } catch (e) {
+    console.error('cloudAddSubmission failed', e);
+    throw e;
+  }
 }
 
 async function cloudDeleteSubmission(id) {
-  const data = await cloudGetAll();
-  await cloudSetAll(data.submissions.filter(s => s.id !== id), data.results);
+  try {
+    await fbDB.ref(`/submissions/${id}`).remove();
+    const data = await cloudGetAll();
+    saveLocalBackup(data);
+    return true;
+  } catch (e) {
+    console.error('cloudDeleteSubmission failed', e);
+    throw e;
+  }
 }
 
 async function cloudSetResult(matchId, pick) {
-  const data = await cloudGetAll();
-  const newResults = { ...data.results };
-  if (pick === null || pick === undefined) {
-    delete newResults[matchId];
-  } else {
-    newResults[matchId] = pick;
+  try {
+    if (pick === null || pick === undefined) {
+      await fbDB.ref(`/results/${matchId}`).remove();
+    } else {
+      await fbDB.ref(`/results/${matchId}`).set(pick);
+    }
+    const data = await cloudGetAll();
+    saveLocalBackup(data);
+    return true;
+  } catch (e) {
+    console.error('cloudSetResult failed', e);
+    throw e;
   }
-  await cloudSetAll(data.submissions, newResults);
+}
+
+async function cloudSetAll(submissions, results) {
+  try {
+    const subsObj = {};
+    submissions.forEach(s => { subsObj[s.id] = s; });
+    await fbDB.ref('/').set({ submissions: subsObj, results: results || {} });
+    saveLocalBackup({ submissions, results });
+    return true;
+  } catch (e) {
+    console.error('cloudSetAll failed', e);
+    throw e;
+  }
 }
 
 // ============== ADMIN STATE ==============
