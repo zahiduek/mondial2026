@@ -974,84 +974,98 @@ function UserDetailView({ user, results, onBack, isAdmin }) {
 }
 
 // ============== EXCEL/CSV EXPORT ==============
-// Export single user's predictions as a CSV file (opens automatically in Excel)
+// Export single user's predictions as a styled Excel file
 function exportUserToCSV(user, results) {
-  const headers = ['מס\' משחק', 'בית', 'תאריך', 'קבוצת בית', 'מול', 'קבוצת חוץ', 'ניחוש המשתתף', 'תוצאה אמיתית', 'נכון?'];
-  const rows = [headers];
-
-  ALL_MATCHES.forEach((m, idx) => {
-    const home = TEAMS[m.home];
-    const away = TEAMS[m.away];
-    const pick = user.predictions?.[m.id] || '';
-    const actual = results?.[m.id] || '';
-    const isCorrect = actual && pick && actual === pick ? '✓' : (actual && pick ? '✗' : '');
-    rows.push([
-      idx + 1,
-      m.group,
-      formatMatchDate(m.utc),
-      home.he,
-      'VS',
-      away.he,
-      pick || '-',
-      actual || '-',
-      isCorrect
-    ]);
-  });
-
-  // Add summary at the end
   const correctCount = Object.entries(user.predictions || {}).filter(([mid, pick]) => results?.[mid] && results[mid] === pick).length;
   const totalPredicted = Object.values(user.predictions || {}).filter(p => p === '1' || p === 'X' || p === '2').length;
   const totalPlayed = Object.keys(results || {}).length;
-  rows.push([]);
-  rows.push(['סיכום:']);
-  rows.push(['שם פרטי', user.firstName]);
-  rows.push(['שם משפחה', user.lastName]);
-  rows.push(['ניחש סך הכל', totalPredicted, 'מתוך 72 משחקים']);
-  rows.push(['ניחושים נכונים', correctCount, `מתוך ${totalPlayed} משחקים ששוחקו`]);
-  rows.push(['הוגש בתאריך', new Date(user.submittedAt).toLocaleString('he-IL')]);
 
-  // Convert to CSV with BOM for Hebrew support in Excel
-  const csv = '\uFEFF' + rows.map(row => row.map(cell => {
-    const str = String(cell ?? '');
-    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-      return '"' + str.replace(/"/g, '""') + '"';
-    }
-    return str;
-  }).join(',')).join('\r\n');
+  // Group matches by group letter
+  const matchesByGroup = {};
+  ALL_MATCHES.forEach((m, idx) => {
+    if (!matchesByGroup[m.group]) matchesByGroup[m.group] = [];
+    matchesByGroup[m.group].push({ ...m, num: idx + 1 });
+  });
 
-  // Download
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  let rowsHtml = '';
+  Object.keys(matchesByGroup).sort().forEach(groupLetter => {
+    rowsHtml += `<tr><td colspan="7" style="background:#FFD700;color:#000;font-weight:bold;font-size:14pt;padding:8px;text-align:center;">⚽ בית ${groupLetter}</td></tr>`;
+    matchesByGroup[groupLetter].forEach(m => {
+      const home = TEAMS[m.home];
+      const away = TEAMS[m.away];
+      const pick = user.predictions?.[m.id] || '-';
+      const actual = results?.[m.id] || '-';
+      const isCorrect = actual !== '-' && pick !== '-' && actual === pick;
+      const isWrong = actual !== '-' && pick !== '-' && actual !== pick;
+      const pickBg = isCorrect ? '#FFEB3B' : (isWrong ? '#FFCDD2' : '#FFFFFF');
+      const correctMark = isCorrect ? '✓ נכון!' : (isWrong ? '✗ טעות' : '');
+      rowsHtml += `
+        <tr>
+          <td style="text-align:center;padding:6px;border:1px solid #ccc;">${m.num}</td>
+          <td style="text-align:center;padding:6px;border:1px solid #ccc;background:#E8F5E9;">${formatMatchDate(m.utc)}</td>
+          <td style="text-align:right;padding:6px;border:1px solid #ccc;font-weight:bold;">${home.he}</td>
+          <td style="text-align:center;padding:6px;border:1px solid #ccc;color:#888;">VS</td>
+          <td style="text-align:right;padding:6px;border:1px solid #ccc;font-weight:bold;">${away.he}</td>
+          <td style="text-align:center;padding:6px;border:1px solid #ccc;background:${pickBg};font-weight:bold;font-size:14pt;">${pick}</td>
+          <td style="text-align:center;padding:6px;border:1px solid #ccc;background:#E3F2FD;font-weight:bold;">${actual}</td>
+          <td style="text-align:center;padding:6px;border:1px solid #ccc;font-weight:bold;color:${isCorrect ? '#2E7D32' : (isWrong ? '#C62828' : '#666')};">${correctMark}</td>
+        </tr>`;
+    });
+  });
+
+  const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta charset="UTF-8">
+<style>
+  body { font-family: Arial, sans-serif; direction: rtl; }
+  table { border-collapse: collapse; width: 100%; }
+  th { background: #1B5E20; color: #FFD700; padding: 12px; border: 2px solid #FFD700; font-size: 12pt; }
+  .header-cell { background: #FFD700; color: #000; padding: 15px; font-size: 18pt; font-weight: bold; text-align: center; }
+  .summary { background: #FFF9C4; }
+</style>
+</head>
+<body>
+<table>
+  <tr><td colspan="8" class="header-cell">🏆 טוטו מונדיאל 2026 — תעש חיפה</td></tr>
+  <tr><td colspan="8" style="background:#1B5E20;color:#FFD700;padding:12px;font-size:14pt;text-align:center;">משתתף: ${user.firstName} ${user.lastName}</td></tr>
+  <tr>
+    <td colspan="2" class="summary" style="padding:10px;text-align:center;border:1px solid #ccc;"><b>הוגש בתאריך:</b> ${new Date(user.submittedAt).toLocaleString('he-IL')}</td>
+    <td colspan="2" class="summary" style="padding:10px;text-align:center;border:1px solid #ccc;"><b>סך ניחושים:</b> ${totalPredicted} / 72</td>
+    <td colspan="2" class="summary" style="padding:10px;text-align:center;border:1px solid #ccc;"><b>משחקים ששוחקו:</b> ${totalPlayed}</td>
+    <td colspan="2" class="summary" style="padding:10px;text-align:center;border:1px solid #ccc;background:#FFEB3B;"><b>ניחושים נכונים:</b> ${correctCount}</td>
+  </tr>
+  <tr>
+    <th>מספר</th>
+    <th>תאריך</th>
+    <th>בית</th>
+    <th></th>
+    <th>חוץ</th>
+    <th>הניחוש</th>
+    <th>תוצאה אמיתית</th>
+    <th>סטטוס</th>
+  </tr>
+  ${rowsHtml}
+</table>
+</body>
+</html>`;
+
+  const blob = new Blob(['\uFEFF', html], { type: 'application/vnd.ms-excel' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  const fname = `מונדיאל2026_${user.firstName}_${user.lastName}.csv`;
-  a.download = fname;
+  a.download = `מונדיאל2026_${user.firstName}_${user.lastName}.xls`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
 
-// Export ALL users at once
+// Export ALL users at once - matrix view
 function exportAllUsersToCSV(users, results) {
   if (!users || users.length === 0) {
     alert('אין נרשמים להוריד');
     return;
   }
-  const headers = ['#', 'שם פרטי', 'שם משפחה', 'תאריך הרשמה', 'ניחושים שמילא', 'ניחושים נכונים'];
-  ALL_MATCHES.forEach((m, idx) => {
-    const home = TEAMS[m.home];
-    const away = TEAMS[m.away];
-    headers.push(`${idx+1}. ${home.he}-${away.he}`);
-  });
-  const rows = [headers];
-
-  // Add row for actual results
-  const resultsRow = ['', 'תוצאות', 'אמיתיות', '', '', ''];
-  ALL_MATCHES.forEach(m => {
-    resultsRow.push(results?.[m.id] || '');
-  });
-  rows.push(resultsRow);
 
   // Sort users by correct count
   const usersSorted = users.map(u => {
@@ -1063,35 +1077,101 @@ function exportAllUsersToCSV(users, results) {
     return { ...u, correct, totalPredicted };
   }).sort((a, b) => b.correct - a.correct);
 
+  // === Sheet 1: Summary leaderboard ===
+  let summaryRows = '';
   usersSorted.forEach((u, idx) => {
-    const row = [
-      idx + 1,
-      u.firstName,
-      u.lastName,
-      new Date(u.submittedAt).toLocaleString('he-IL'),
-      u.totalPredicted,
-      u.correct
-    ];
-    ALL_MATCHES.forEach(m => {
-      row.push(u.predictions?.[m.id] || '');
-    });
-    rows.push(row);
+    const medal = idx === 0 ? '🥇' : (idx === 1 ? '🥈' : (idx === 2 ? '🥉' : (idx + 1)));
+    const bgColor = idx === 0 ? '#FFD700' : (idx === 1 ? '#C0C0C0' : (idx === 2 ? '#CD7F32' : '#FFFFFF'));
+    summaryRows += `
+      <tr style="background:${bgColor};">
+        <td style="text-align:center;padding:10px;border:1px solid #ccc;font-size:16pt;font-weight:bold;">${medal}</td>
+        <td style="text-align:right;padding:10px;border:1px solid #ccc;font-size:14pt;font-weight:bold;">${u.firstName} ${u.lastName}</td>
+        <td style="text-align:center;padding:10px;border:1px solid #ccc;font-size:18pt;font-weight:bold;color:#1B5E20;">${u.correct}</td>
+        <td style="text-align:center;padding:10px;border:1px solid #ccc;">${u.totalPredicted} / 72</td>
+        <td style="text-align:center;padding:10px;border:1px solid #ccc;">${new Date(u.submittedAt).toLocaleDateString('he-IL')}</td>
+      </tr>`;
   });
 
-  const csv = '\uFEFF' + rows.map(row => row.map(cell => {
-    const str = String(cell ?? '');
-    if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-      return '"' + str.replace(/"/g, '""') + '"';
-    }
-    return str;
-  }).join(',')).join('\r\n');
+  // === Sheet 2: Full matrix - all users vs all matches ===
+  let matrixHeader = '<th style="background:#1B5E20;color:#FFD700;padding:10px;border:1px solid #FFD700;writing-mode:vertical-rl;min-width:30px;">מס</th>';
+  matrixHeader += '<th style="background:#1B5E20;color:#FFD700;padding:10px;border:1px solid #FFD700;">בית</th>';
+  matrixHeader += '<th style="background:#1B5E20;color:#FFD700;padding:10px;border:1px solid #FFD700;">משחק</th>';
+  matrixHeader += '<th style="background:#FFD700;color:#000;padding:10px;border:1px solid #FFD700;">תוצאה אמיתית</th>';
+  usersSorted.forEach(u => {
+    matrixHeader += `<th style="background:#1B5E20;color:#FFD700;padding:10px;border:1px solid #FFD700;min-width:80px;">${u.firstName}<br>${u.lastName}</th>`;
+  });
 
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  let matrixRows = '';
+  ALL_MATCHES.forEach((m, idx) => {
+    const home = TEAMS[m.home];
+    const away = TEAMS[m.away];
+    const actual = results?.[m.id] || '-';
+    matrixRows += `<tr>`;
+    matrixRows += `<td style="text-align:center;padding:6px;border:1px solid #ccc;">${idx+1}</td>`;
+    matrixRows += `<td style="text-align:center;padding:6px;border:1px solid #ccc;background:#FFF9C4;font-weight:bold;">${m.group}</td>`;
+    matrixRows += `<td style="text-align:right;padding:6px;border:1px solid #ccc;white-space:nowrap;">${home.he} - ${away.he}</td>`;
+    matrixRows += `<td style="text-align:center;padding:6px;border:1px solid #ccc;background:#E3F2FD;font-weight:bold;font-size:14pt;">${actual}</td>`;
+    usersSorted.forEach(u => {
+      const pick = u.predictions?.[m.id] || '-';
+      const isCorrect = actual !== '-' && pick !== '-' && actual === pick;
+      const bg = isCorrect ? '#FFEB3B' : '#FFFFFF';
+      const fw = isCorrect ? 'bold' : 'normal';
+      matrixRows += `<td style="text-align:center;padding:6px;border:1px solid #ccc;background:${bg};font-weight:${fw};">${pick}</td>`;
+    });
+    matrixRows += `</tr>`;
+  });
+
+  // Footer row - totals
+  let footerRow = '<tr style="background:#FFD700;font-weight:bold;">';
+  footerRow += '<td colspan="4" style="text-align:center;padding:10px;border:2px solid #1B5E20;font-size:14pt;">סך ניחושים נכונים →</td>';
+  usersSorted.forEach(u => {
+    footerRow += `<td style="text-align:center;padding:10px;border:2px solid #1B5E20;font-size:18pt;color:#1B5E20;">${u.correct}</td>`;
+  });
+  footerRow += '</tr>';
+
+  const today = new Date().toLocaleDateString('he-IL');
+  const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta charset="UTF-8">
+<style>
+  body { font-family: Arial, sans-serif; direction: rtl; }
+  table { border-collapse: collapse; margin-bottom: 30px; }
+  h1 { color: #1B5E20; }
+  h2 { color: #1B5E20; border-bottom: 3px solid #FFD700; padding-bottom: 5px; }
+</style>
+</head>
+<body>
+<h1 style="text-align:center;color:#1B5E20;">🏆 טוטו מונדיאל 2026 — תעש חיפה</h1>
+<p style="text-align:center;">תאריך גיבוי: ${today} · סך נרשמים: ${users.length} · משחקים ששוחקו: ${Object.keys(results || {}).length}</p>
+
+<h2>📊 טבלת דירוג</h2>
+<table style="width:100%;">
+  <tr>
+    <th style="background:#1B5E20;color:#FFD700;padding:12px;border:1px solid #FFD700;">מקום</th>
+    <th style="background:#1B5E20;color:#FFD700;padding:12px;border:1px solid #FFD700;">שם המשתתף</th>
+    <th style="background:#1B5E20;color:#FFD700;padding:12px;border:1px solid #FFD700;">ניחושים נכונים</th>
+    <th style="background:#1B5E20;color:#FFD700;padding:12px;border:1px solid #FFD700;">ניחושים שמילא</th>
+    <th style="background:#1B5E20;color:#FFD700;padding:12px;border:1px solid #FFD700;">תאריך הרשמה</th>
+  </tr>
+  ${summaryRows}
+</table>
+
+<h2>📋 טבלת ניחושים מלאה</h2>
+<p style="font-size:11pt;color:#666;">🟡 רקע צהוב = ניחוש נכון</p>
+<table style="width:100%;">
+  <tr>${matrixHeader}</tr>
+  ${matrixRows}
+  ${footerRow}
+</table>
+
+</body>
+</html>`;
+
+  const blob = new Blob(['\uFEFF', html], { type: 'application/vnd.ms-excel' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  const today = new Date().toLocaleDateString('he-IL').replace(/\//g, '-');
-  a.download = `מונדיאל2026_גיבוי_מלא_${today}.csv`;
+  a.download = `מונדיאל2026_גיבוי_מלא_${today.replace(/\//g, '-')}.xls`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
