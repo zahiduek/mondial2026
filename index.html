@@ -14,6 +14,7 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/flag-icons/7.2.3/css/flag-icons.min.css">
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
   body { margin: 0; background: #000; font-family: 'Heebo', sans-serif; }
   .display-font { font-family: 'Anton', 'Bebas Neue', sans-serif; letter-spacing: 0.02em; }
@@ -122,24 +123,53 @@ const API_NAME_TO_CODE = {
 // Fetch finished matches from API and return mapping of matchId -> "1"/"X"/"2"
 async function fetchResultsFromAPI() {
   try {
-    const r = await fetch(`${WC2026_API_BASE}/matches?status=finished&round=group`, {
+    // Use /matches endpoint - API returns objects with home_team/away_team as nested objects {id, name, code}
+    const r = await fetch(`${WC2026_API_BASE}/matches?round=group`, {
       headers: { 'Authorization': `Bearer ${WC2026_API_KEY}` }
     });
     if (!r.ok) {
       console.error('API responded with', r.status);
-      return { success: false, error: `שגיאת API: ${r.status}`, results: {} };
+      return { success: false, error: `שגיאת API: ${r.status}`, results: {}, debug: `HTTP ${r.status}` };
     }
     const data = await r.json();
     const matches = Array.isArray(data) ? data : (data.matches || data.data || []);
+    console.log('API returned', matches.length, 'matches. First match:', matches[0]);
+
     const apiResults = {};
     let matched = 0;
     let unmatched = [];
+    let totalFinished = 0;
 
     matches.forEach(apiMatch => {
-      const homeCode = API_NAME_TO_CODE[apiMatch.home_team];
-      const awayCode = API_NAME_TO_CODE[apiMatch.away_team];
+      // Skip non-finished matches
+      const status = (apiMatch.status || '').toLowerCase();
+      if (status !== 'finished' && status !== 'completed' && status !== 'ft' && status !== 'full_time') {
+        // Also accept matches with both scores set
+        const hs = apiMatch.home_score ?? apiMatch.score?.home ?? apiMatch.goals?.home;
+        const as = apiMatch.away_score ?? apiMatch.score?.away ?? apiMatch.goals?.away;
+        if (hs == null || as == null) return;
+      }
+      totalFinished++;
+
+      // home_team and away_team are objects: {id, name, code}
+      // Extract codes (e.g., "USA", "MEX")
+      let homeCode, awayCode;
+      if (typeof apiMatch.home_team === 'object' && apiMatch.home_team !== null) {
+        homeCode = apiMatch.home_team.code;
+      } else {
+        // Fallback - it's a string, try mapping
+        homeCode = API_NAME_TO_CODE[apiMatch.home_team];
+      }
+      if (typeof apiMatch.away_team === 'object' && apiMatch.away_team !== null) {
+        awayCode = apiMatch.away_team.code;
+      } else {
+        awayCode = API_NAME_TO_CODE[apiMatch.away_team];
+      }
+
       if (!homeCode || !awayCode) {
-        unmatched.push(`${apiMatch.home_team} vs ${apiMatch.away_team}`);
+        const homeStr = typeof apiMatch.home_team === 'object' ? (apiMatch.home_team?.name || JSON.stringify(apiMatch.home_team)) : apiMatch.home_team;
+        const awayStr = typeof apiMatch.away_team === 'object' ? (apiMatch.away_team?.name || JSON.stringify(apiMatch.away_team)) : apiMatch.away_team;
+        unmatched.push(`${homeStr} vs ${awayStr}`);
         return;
       }
       // Find our match
@@ -147,12 +177,18 @@ async function fetchResultsFromAPI() {
         (m.home === homeCode && m.away === awayCode) ||
         (m.home === awayCode && m.away === homeCode)
       );
-      if (!ourMatch) return;
+      if (!ourMatch) {
+        unmatched.push(`${homeCode} vs ${awayCode} (לא נמצא ברשימה)`);
+        return;
+      }
 
       // Extract score - try common field names
       const homeScore = apiMatch.home_score ?? apiMatch.score?.home ?? apiMatch.goals?.home;
       const awayScore = apiMatch.away_score ?? apiMatch.score?.away ?? apiMatch.goals?.away;
-      if (homeScore == null || awayScore == null) return;
+      if (homeScore == null || awayScore == null) {
+        unmatched.push(`${homeCode}-${awayCode} (ללא תוצאה)`);
+        return;
+      }
 
       // Determine 1/X/2 based on ORDER as we stored it
       const reversed = ourMatch.home === awayCode;
@@ -167,7 +203,7 @@ async function fetchResultsFromAPI() {
       matched++;
     });
 
-    return { success: true, results: apiResults, matched, unmatched };
+    return { success: true, results: apiResults, matched, unmatched, totalFinished, totalReturned: matches.length };
   } catch (e) {
     console.error('fetchResultsFromAPI failed', e);
     return { success: false, error: `שגיאה: ${e.message}. ייתכן שיש חסימת CORS`, results: {} };
@@ -1012,94 +1048,78 @@ function UserDetailView({ user, results, onBack, isAdmin }) {
   );
 }
 
-// ============== EXCEL/CSV EXPORT ==============
-// Export single user's predictions as a styled Excel file
+// ============== EXCEL EXPORT (using SheetJS) ==============
+// Export single user's predictions as a real XLSX file
 function exportUserToCSV(user, results) {
   const correctCount = Object.entries(user.predictions || {}).filter(([mid, pick]) => results?.[mid] && results[mid] === pick).length;
   const totalPredicted = Object.values(user.predictions || {}).filter(p => p === '1' || p === 'X' || p === '2').length;
   const totalPlayed = Object.keys(results || {}).length;
 
-  // Group matches by group letter
-  const matchesByGroup = {};
+  // Build data array
+  const data = [];
+  data.push(['🏆 טוטו מונדיאל 2026 — תעש חיפה']);
+  data.push([`משתתף: ${user.firstName} ${user.lastName}`]);
+  data.push([`הוגש בתאריך: ${new Date(user.submittedAt).toLocaleString('he-IL')}`]);
+  data.push([`סך ניחושים: ${totalPredicted} / 72`, '', `משחקים ששוחקו: ${totalPlayed}`, '', `ניחושים נכונים: ${correctCount}`]);
+  data.push([]);
+  data.push(['מספר', 'תאריך', 'בית', 'קבוצה ביתית', 'מול', 'קבוצה אורחת', 'הניחוש', 'תוצאה אמיתית', 'סטטוס']);
+
   ALL_MATCHES.forEach((m, idx) => {
-    if (!matchesByGroup[m.group]) matchesByGroup[m.group] = [];
-    matchesByGroup[m.group].push({ ...m, num: idx + 1 });
+    const home = TEAMS[m.home];
+    const away = TEAMS[m.away];
+    const pick = user.predictions?.[m.id] || '-';
+    const actual = results?.[m.id] || '-';
+    const isCorrect = actual !== '-' && pick !== '-' && actual === pick;
+    const isWrong = actual !== '-' && pick !== '-' && actual !== pick;
+    const status = isCorrect ? '✓ נכון' : (isWrong ? '✗ טעות' : '');
+    data.push([
+      idx + 1,
+      formatMatchDate(m.utc),
+      m.group,
+      home.he,
+      'VS',
+      away.he,
+      pick,
+      actual,
+      status
+    ]);
   });
 
-  let rowsHtml = '';
-  Object.keys(matchesByGroup).sort().forEach(groupLetter => {
-    rowsHtml += `<tr><td colspan="7" style="background:#FFD700;color:#000;font-weight:bold;font-size:14pt;padding:8px;text-align:center;">⚽ בית ${groupLetter}</td></tr>`;
-    matchesByGroup[groupLetter].forEach(m => {
-      const home = TEAMS[m.home];
-      const away = TEAMS[m.away];
-      const pick = user.predictions?.[m.id] || '-';
-      const actual = results?.[m.id] || '-';
-      const isCorrect = actual !== '-' && pick !== '-' && actual === pick;
-      const isWrong = actual !== '-' && pick !== '-' && actual !== pick;
-      const pickBg = isCorrect ? '#FFEB3B' : (isWrong ? '#FFCDD2' : '#FFFFFF');
-      const correctMark = isCorrect ? '✓ נכון!' : (isWrong ? '✗ טעות' : '');
-      rowsHtml += `
-        <tr>
-          <td style="text-align:center;padding:6px;border:1px solid #ccc;">${m.num}</td>
-          <td style="text-align:center;padding:6px;border:1px solid #ccc;background:#E8F5E9;">${formatMatchDate(m.utc)}</td>
-          <td style="text-align:right;padding:6px;border:1px solid #ccc;font-weight:bold;">${home.he}</td>
-          <td style="text-align:center;padding:6px;border:1px solid #ccc;color:#888;">VS</td>
-          <td style="text-align:right;padding:6px;border:1px solid #ccc;font-weight:bold;">${away.he}</td>
-          <td style="text-align:center;padding:6px;border:1px solid #ccc;background:${pickBg};font-weight:bold;font-size:14pt;">${pick}</td>
-          <td style="text-align:center;padding:6px;border:1px solid #ccc;background:#E3F2FD;font-weight:bold;">${actual}</td>
-          <td style="text-align:center;padding:6px;border:1px solid #ccc;font-weight:bold;color:${isCorrect ? '#2E7D32' : (isWrong ? '#C62828' : '#666')};">${correctMark}</td>
-        </tr>`;
-    });
-  });
+  // Create workbook
+  const ws = XLSX.utils.aoa_to_sheet(data);
 
-  const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40">
-<head>
-<meta charset="UTF-8">
-<style>
-  body { font-family: Arial, sans-serif; direction: rtl; }
-  table { border-collapse: collapse; width: 100%; }
-  th { background: #1B5E20; color: #FFD700; padding: 12px; border: 2px solid #FFD700; font-size: 12pt; }
-  .header-cell { background: #FFD700; color: #000; padding: 15px; font-size: 18pt; font-weight: bold; text-align: center; }
-  .summary { background: #FFF9C4; }
-</style>
-</head>
-<body>
-<table>
-  <tr><td colspan="8" class="header-cell">🏆 טוטו מונדיאל 2026 — תעש חיפה</td></tr>
-  <tr><td colspan="8" style="background:#1B5E20;color:#FFD700;padding:12px;font-size:14pt;text-align:center;">משתתף: ${user.firstName} ${user.lastName}</td></tr>
-  <tr>
-    <td colspan="2" class="summary" style="padding:10px;text-align:center;border:1px solid #ccc;"><b>הוגש בתאריך:</b> ${new Date(user.submittedAt).toLocaleString('he-IL')}</td>
-    <td colspan="2" class="summary" style="padding:10px;text-align:center;border:1px solid #ccc;"><b>סך ניחושים:</b> ${totalPredicted} / 72</td>
-    <td colspan="2" class="summary" style="padding:10px;text-align:center;border:1px solid #ccc;"><b>משחקים ששוחקו:</b> ${totalPlayed}</td>
-    <td colspan="2" class="summary" style="padding:10px;text-align:center;border:1px solid #ccc;background:#FFEB3B;"><b>ניחושים נכונים:</b> ${correctCount}</td>
-  </tr>
-  <tr>
-    <th>מספר</th>
-    <th>תאריך</th>
-    <th>בית</th>
-    <th></th>
-    <th>חוץ</th>
-    <th>הניחוש</th>
-    <th>תוצאה אמיתית</th>
-    <th>סטטוס</th>
-  </tr>
-  ${rowsHtml}
-</table>
-</body>
-</html>`;
+  // Set column widths
+  ws['!cols'] = [
+    { wch: 8 },   // מספר
+    { wch: 20 },  // תאריך
+    { wch: 8 },   // בית
+    { wch: 18 },  // קבוצה ביתית
+    { wch: 5 },   // VS
+    { wch: 18 },  // קבוצה אורחת
+    { wch: 10 },  // הניחוש
+    { wch: 12 },  // תוצאה
+    { wch: 10 }   // סטטוס
+  ];
 
-  const blob = new Blob(['\uFEFF', html], { type: 'application/vnd.ms-excel' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `מונדיאל2026_${user.firstName}_${user.lastName}.xls`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  // Set RTL view
+  if (!ws['!views']) ws['!views'] = [{}];
+  ws['!views'][0].RTL = true;
+
+  // Merge title cells
+  ws['!merges'] = [
+    { s: { r: 0, c: 0 }, e: { r: 0, c: 8 } },
+    { s: { r: 1, c: 0 }, e: { r: 1, c: 8 } },
+    { s: { r: 2, c: 0 }, e: { r: 2, c: 8 } }
+  ];
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'ניחושים');
+
+  // Write file
+  XLSX.writeFile(wb, `מונדיאל2026_${user.firstName}_${user.lastName}.xlsx`);
 }
 
-// Export ALL users at once - matrix view
+// Export ALL users at once
 function exportAllUsersToCSV(users, results) {
   if (!users || users.length === 0) {
     alert('אין נרשמים להוריד');
@@ -1116,106 +1136,82 @@ function exportAllUsersToCSV(users, results) {
     return { ...u, correct, totalPredicted };
   }).sort((a, b) => b.correct - a.correct);
 
-  // === Sheet 1: Summary leaderboard ===
-  let summaryRows = '';
+  // === Sheet 1: Leaderboard ===
+  const leaderboardData = [];
+  leaderboardData.push(['🏆 טוטו מונדיאל 2026 — תעש חיפה']);
+  leaderboardData.push([`תאריך גיבוי: ${new Date().toLocaleDateString('he-IL')} | נרשמים: ${users.length} | משחקים ששוחקו: ${Object.keys(results || {}).length}`]);
+  leaderboardData.push([]);
+  leaderboardData.push(['📊 טבלת דירוג']);
+  leaderboardData.push([]);
+  leaderboardData.push(['מקום', 'שם פרטי', 'שם משפחה', 'ניחושים נכונים', 'ניחושים שמילא', 'תאריך הרשמה']);
+
   usersSorted.forEach((u, idx) => {
-    const medal = idx === 0 ? '🥇' : (idx === 1 ? '🥈' : (idx === 2 ? '🥉' : (idx + 1)));
-    const bgColor = idx === 0 ? '#FFD700' : (idx === 1 ? '#C0C0C0' : (idx === 2 ? '#CD7F32' : '#FFFFFF'));
-    summaryRows += `
-      <tr style="background:${bgColor};">
-        <td style="text-align:center;padding:10px;border:1px solid #ccc;font-size:16pt;font-weight:bold;">${medal}</td>
-        <td style="text-align:right;padding:10px;border:1px solid #ccc;font-size:14pt;font-weight:bold;">${u.firstName} ${u.lastName}</td>
-        <td style="text-align:center;padding:10px;border:1px solid #ccc;font-size:18pt;font-weight:bold;color:#1B5E20;">${u.correct}</td>
-        <td style="text-align:center;padding:10px;border:1px solid #ccc;">${u.totalPredicted} / 72</td>
-        <td style="text-align:center;padding:10px;border:1px solid #ccc;">${new Date(u.submittedAt).toLocaleDateString('he-IL')}</td>
-      </tr>`;
+    const place = idx === 0 ? '🥇 1' : (idx === 1 ? '🥈 2' : (idx === 2 ? '🥉 3' : (idx + 1)));
+    leaderboardData.push([
+      place,
+      u.firstName,
+      u.lastName,
+      u.correct,
+      u.totalPredicted,
+      new Date(u.submittedAt).toLocaleDateString('he-IL')
+    ]);
   });
 
-  // === Sheet 2: Full matrix - all users vs all matches ===
-  let matrixHeader = '<th style="background:#1B5E20;color:#FFD700;padding:10px;border:1px solid #FFD700;writing-mode:vertical-rl;min-width:30px;">מס</th>';
-  matrixHeader += '<th style="background:#1B5E20;color:#FFD700;padding:10px;border:1px solid #FFD700;">בית</th>';
-  matrixHeader += '<th style="background:#1B5E20;color:#FFD700;padding:10px;border:1px solid #FFD700;">משחק</th>';
-  matrixHeader += '<th style="background:#FFD700;color:#000;padding:10px;border:1px solid #FFD700;">תוצאה אמיתית</th>';
+  const ws1 = XLSX.utils.aoa_to_sheet(leaderboardData);
+  ws1['!cols'] = [
+    { wch: 10 }, { wch: 15 }, { wch: 15 }, { wch: 18 }, { wch: 18 }, { wch: 15 }
+  ];
+  if (!ws1['!views']) ws1['!views'] = [{}];
+  ws1['!views'][0].RTL = true;
+  ws1['!merges'] = [
+    { s: { r: 0, c: 0 }, e: { r: 0, c: 5 } },
+    { s: { r: 1, c: 0 }, e: { r: 1, c: 5 } },
+    { s: { r: 3, c: 0 }, e: { r: 3, c: 5 } }
+  ];
+
+  // === Sheet 2: Full matrix ===
+  const matrixHeader = ['מס\'', 'בית', 'משחק', 'תוצאה אמיתית'];
   usersSorted.forEach(u => {
-    matrixHeader += `<th style="background:#1B5E20;color:#FFD700;padding:10px;border:1px solid #FFD700;min-width:80px;">${u.firstName}<br>${u.lastName}</th>`;
+    matrixHeader.push(`${u.firstName} ${u.lastName}`);
   });
 
-  let matrixRows = '';
+  const matrixData = [matrixHeader];
+
   ALL_MATCHES.forEach((m, idx) => {
     const home = TEAMS[m.home];
     const away = TEAMS[m.away];
     const actual = results?.[m.id] || '-';
-    matrixRows += `<tr>`;
-    matrixRows += `<td style="text-align:center;padding:6px;border:1px solid #ccc;">${idx+1}</td>`;
-    matrixRows += `<td style="text-align:center;padding:6px;border:1px solid #ccc;background:#FFF9C4;font-weight:bold;">${m.group}</td>`;
-    matrixRows += `<td style="text-align:right;padding:6px;border:1px solid #ccc;white-space:nowrap;">${home.he} - ${away.he}</td>`;
-    matrixRows += `<td style="text-align:center;padding:6px;border:1px solid #ccc;background:#E3F2FD;font-weight:bold;font-size:14pt;">${actual}</td>`;
+    const row = [idx + 1, m.group, `${home.he} - ${away.he}`, actual];
     usersSorted.forEach(u => {
       const pick = u.predictions?.[m.id] || '-';
-      const isCorrect = actual !== '-' && pick !== '-' && actual === pick;
-      const bg = isCorrect ? '#FFEB3B' : '#FFFFFF';
-      const fw = isCorrect ? 'bold' : 'normal';
-      matrixRows += `<td style="text-align:center;padding:6px;border:1px solid #ccc;background:${bg};font-weight:${fw};">${pick}</td>`;
+      row.push(pick);
     });
-    matrixRows += `</tr>`;
+    matrixData.push(row);
   });
 
   // Footer row - totals
-  let footerRow = '<tr style="background:#FFD700;font-weight:bold;">';
-  footerRow += '<td colspan="4" style="text-align:center;padding:10px;border:2px solid #1B5E20;font-size:14pt;">סך ניחושים נכונים →</td>';
+  const footerRow = ['', '', 'סך ניחושים נכונים →', ''];
   usersSorted.forEach(u => {
-    footerRow += `<td style="text-align:center;padding:10px;border:2px solid #1B5E20;font-size:18pt;color:#1B5E20;">${u.correct}</td>`;
+    footerRow.push(u.correct);
   });
-  footerRow += '</tr>';
+  matrixData.push(footerRow);
 
-  const today = new Date().toLocaleDateString('he-IL');
-  const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40">
-<head>
-<meta charset="UTF-8">
-<style>
-  body { font-family: Arial, sans-serif; direction: rtl; }
-  table { border-collapse: collapse; margin-bottom: 30px; }
-  h1 { color: #1B5E20; }
-  h2 { color: #1B5E20; border-bottom: 3px solid #FFD700; padding-bottom: 5px; }
-</style>
-</head>
-<body>
-<h1 style="text-align:center;color:#1B5E20;">🏆 טוטו מונדיאל 2026 — תעש חיפה</h1>
-<p style="text-align:center;">תאריך גיבוי: ${today} · סך נרשמים: ${users.length} · משחקים ששוחקו: ${Object.keys(results || {}).length}</p>
+  const ws2 = XLSX.utils.aoa_to_sheet(matrixData);
+  const cols = [{ wch: 5 }, { wch: 6 }, { wch: 25 }, { wch: 12 }];
+  usersSorted.forEach(() => cols.push({ wch: 12 }));
+  ws2['!cols'] = cols;
+  if (!ws2['!views']) ws2['!views'] = [{}];
+  ws2['!views'][0].RTL = true;
 
-<h2>📊 טבלת דירוג</h2>
-<table style="width:100%;">
-  <tr>
-    <th style="background:#1B5E20;color:#FFD700;padding:12px;border:1px solid #FFD700;">מקום</th>
-    <th style="background:#1B5E20;color:#FFD700;padding:12px;border:1px solid #FFD700;">שם המשתתף</th>
-    <th style="background:#1B5E20;color:#FFD700;padding:12px;border:1px solid #FFD700;">ניחושים נכונים</th>
-    <th style="background:#1B5E20;color:#FFD700;padding:12px;border:1px solid #FFD700;">ניחושים שמילא</th>
-    <th style="background:#1B5E20;color:#FFD700;padding:12px;border:1px solid #FFD700;">תאריך הרשמה</th>
-  </tr>
-  ${summaryRows}
-</table>
+  // Create workbook with both sheets
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws1, 'דירוג');
+  XLSX.utils.book_append_sheet(wb, ws2, 'טבלת ניחושים');
 
-<h2>📋 טבלת ניחושים מלאה</h2>
-<p style="font-size:11pt;color:#666;">🟡 רקע צהוב = ניחוש נכון</p>
-<table style="width:100%;">
-  <tr>${matrixHeader}</tr>
-  ${matrixRows}
-  ${footerRow}
-</table>
-
-</body>
-</html>`;
-
-  const blob = new Blob(['\uFEFF', html], { type: 'application/vnd.ms-excel' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `מונדיאל2026_גיבוי_מלא_${today.replace(/\//g, '-')}.xls`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  const today = new Date().toLocaleDateString('he-IL').replace(/\//g, '-');
+  XLSX.writeFile(wb, `מונדיאל2026_גיבוי_מלא_${today}.xlsx`);
 }
+
 
 // ============== LEADERBOARD VIEW ==============
 function LeaderboardView({ users, results, onBack }) {
@@ -1455,7 +1451,11 @@ function ResultsEntryView({ results, onBack, onSetResult, onAutoFetch }) {
     if (result.success) {
       const newCount = Object.keys(result.results).length;
       if (newCount === 0) {
-        setFetchMsg('לא נמצאו משחקים שנגמרו עדיין');
+        let msg = `לא נמצאו משחקים שנגמרו עדיין (קיבלנו ${result.totalReturned || 0} משחקים מה־API)`;
+        if (result.unmatched && result.unmatched.length > 0) {
+          msg += ` · ${result.unmatched.length} לא תאמו`;
+        }
+        setFetchMsg(msg);
       } else {
         setFetchMsg(`✓ עודכנו ${result.matched} משחקים מהאינטרנט!`);
       }
@@ -1463,7 +1463,7 @@ function ResultsEntryView({ results, onBack, onSetResult, onAutoFetch }) {
       setFetchMsg(result.error || 'שגיאה במשיכה');
     }
     setFetching(false);
-    setTimeout(() => setFetchMsg(''), 5000);
+    setTimeout(() => setFetchMsg(''), 10000);
   };
 
   const totalSet = Object.keys(results).length;
@@ -1572,6 +1572,22 @@ function EditUserView({ user, onBack, onSave, onDelete }) {
 
   const filledCount = Object.values(predictions).filter(p => p === '1' || p === 'X' || p === '2').length;
 
+  // Winning form based on wisdom of crowd (29 users)
+  const WINNING_FORM = ["1","2","2","1","2","2","1","2","1","1","1","1","1","1","2","X","1","1","2","1","1","X","1","2","1","1","1","1","1","2","1","1","2","X","1","1","1","1","1","2","1","1","1","X","1","1","2","1","X","1","2","1","2","2","2","2","1","2","1","1","2","1","2","2","1","2","2","1","2","X","2","2"];
+
+  const applyWinningForm = () => {
+    if (!confirm('פעולה זו תחליף את כל 72 הניחושים הקיימים של המשתתף בטופס "חוכמת ההמונים".\n\nהאם להמשיך?')) return;
+    const newPredictions = {};
+    ALL_MATCHES.forEach((m, idx) => {
+      const pick = WINNING_FORM[idx];
+      if (pick === '1' || pick === 'X' || pick === '2') {
+        newPredictions[m.id] = pick;
+      }
+    });
+    setPredictions(newPredictions);
+    alert('✓ הטופס המנצח הוחל!\n\nאל תשכח ללחוץ "שמור שינויים" למטה.');
+  };
+
   const handleSave = async () => {
     setSaving(true);
     await onSave({ ...user, firstName: firstName.trim(), lastName: lastName.trim(), predictions });
@@ -1618,6 +1634,14 @@ function EditUserView({ user, onBack, onSave, onDelete }) {
             <Trash2 className="w-4 h-4" /> מחק נרשם זה לצמיתות
           </button>
         </div>
+
+        {/* Apply winning form button */}
+        <button
+          onClick={applyWinningForm}
+          className="mb-6 w-full bg-gradient-to-b from-yellow-500 to-yellow-700 hover:from-yellow-400 hover:to-yellow-600 active:scale-[0.98] transition-all text-black display-font text-lg py-4 rounded-2xl shadow-lg border-2 border-yellow-300 flex items-center justify-center gap-2"
+        >
+          <Trophy className="w-5 h-5" /> 🏆 החל את "הטופס המנצח" (חוכמת ההמונים)
+        </button>
 
         <h3 className="display-font text-white text-lg mb-3">עריכת ניחושים</h3>
         <div className="space-y-3">
