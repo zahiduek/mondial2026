@@ -992,6 +992,23 @@ function UserDetailView({ user, results, onBack, isAdmin }) {
             );
           })}
         </div>
+        {/* Color legend - shows when there are results */}
+        {Object.keys(results || {}).length > 0 && (
+          <div className="bg-black/50 border border-white/10 rounded-xl p-3 mb-4 fade-up flex flex-wrap items-center justify-center gap-3 text-xs">
+            <div className="flex items-center gap-1.5">
+              <span className="w-4 h-4 rounded bg-gradient-to-b from-blue-500 to-blue-700 border border-blue-300"></span>
+              <span className="text-white/70">הבחירה של הנרשם</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-4 h-4 rounded bg-gradient-to-b from-green-500 to-green-700 border border-green-300"></span>
+              <span className="text-white/70">תוצאת המשחק בפועל</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-4 h-4 rounded bg-gradient-to-b from-yellow-400 to-yellow-600 border border-yellow-300"></span>
+              <span className="text-white/70">ניחש נכון (בחירה = תוצאה)</span>
+            </div>
+          </div>
+        )}
         <div className="space-y-3">
           {ALL_MATCHES.map((m, idx) => {
             const home = TEAMS[m.home], away = TEAMS[m.away];
@@ -1019,26 +1036,40 @@ function UserDetailView({ user, results, onBack, isAdmin }) {
                 </div>
                 <div className="flex gap-2">
                   {['1','X','2'].map(opt => {
-                    const active = pick === opt;
-                    const isActualResult = actual === opt;
-                    let cls = 'bg-black/30 text-white/15 border-white/10';
-                    if (active && isCorrect) cls = 'bg-gradient-to-b from-yellow-400 to-yellow-600 text-black border-yellow-300 shadow-lg shadow-yellow-500/50 ring-2 ring-yellow-300';
-                    else if (active && isWrong) cls = 'bg-black/40 text-white/30 border-white/15';
-                    else if (active) cls = 'bg-gradient-to-b from-yellow-400 to-yellow-600 text-black border-yellow-300';
-                    else if (isActualResult) cls = 'bg-green-700/30 text-green-300 border-green-500/40';
+                    const isPick = pick === opt;          // what the user chose
+                    const isActualResult = actual === opt; // the real outcome
+                    let cls = 'bg-black/30 text-white/20 border-white/10';
+                    let badge = null;
+
+                    if (isPick && isActualResult) {
+                      // User's pick equals the actual result = correct!
+                      cls = 'bg-gradient-to-b from-yellow-400 to-yellow-600 text-black border-yellow-300 shadow-lg shadow-yellow-500/50 ring-2 ring-yellow-300';
+                      badge = <span className="absolute -top-2 -right-1 text-[10px] bg-yellow-400 text-black font-bold px-1.5 py-0.5 rounded-full border border-yellow-200">✓ בחירה+תוצאה</span>;
+                    } else if (isPick) {
+                      // User's pick (but not the result) - always clearly shown in BLUE
+                      cls = 'bg-gradient-to-b from-blue-500 to-blue-700 text-white border-blue-300 ring-2 ring-blue-300/60';
+                      badge = <span className="absolute -top-2 -right-1 text-[10px] bg-blue-500 text-white font-bold px-1.5 py-0.5 rounded-full border border-blue-300">הבחירה שלו</span>;
+                    } else if (isActualResult) {
+                      // The actual game result (user didn't pick this) - shown in GREEN
+                      cls = 'bg-gradient-to-b from-green-500 to-green-700 text-white border-green-300 ring-2 ring-green-300/60';
+                      badge = <span className="absolute -top-2 -right-1 text-[10px] bg-green-600 text-white font-bold px-1.5 py-0.5 rounded-full border border-green-300">תוצאת המשחק</span>;
+                    }
                     return (
-                      <div key={opt} className={`flex-1 h-14 rounded-xl display-font text-2xl flex items-center justify-center border-2 ${cls}`}>{opt}</div>
+                      <div key={opt} className={`relative flex-1 h-14 rounded-xl display-font text-2xl flex items-center justify-center border-2 ${cls}`}>
+                        {opt}
+                        {badge}
+                      </div>
                     );
                   })}
                 </div>
                 {actual && (
-                  <div className="mt-2 text-center">
-                    {isCorrect ? <span className="text-yellow-300 text-xs font-bold">✓ ניחוש נכון!</span>
-                    : isWrong ? <span className="text-white/40 text-xs">תוצאה אמיתית: {actual}</span>
-                    : null}
+                  <div className="mt-3 text-center">
+                    {isCorrect ? <span className="text-yellow-300 text-sm font-bold">🎯 ניחש נכון! (בחר {pick} והתוצאה {actual})</span>
+                    : isWrong ? <span className="text-white/60 text-xs">בחר <span className="text-blue-300 font-bold">{pick}</span> · התוצאה בפועל <span className="text-green-300 font-bold">{actual}</span></span>
+                    : <span className="text-white/40 text-xs">לא ניחש · התוצאה בפועל <span className="text-green-300 font-bold">{actual}</span></span>}
                   </div>
                 )}
-                {!pick && <div className="text-white/30 text-xs text-center mt-2">לא סומן</div>}
+                {!pick && !actual && <div className="text-white/30 text-xs text-center mt-2">לא סומן</div>}
               </div>
             );
           })}
@@ -1687,6 +1718,52 @@ function App() {
     return () => clearInterval(interval);
   }, [view]);
 
+  // ============== AUTO-FETCH RESULTS EVERY HOUR ==============
+  // Runs for ALL users (not just admins) - protected by shared Firebase clock
+  // so the API is only called once per hour, no matter how many tabs/users are open
+  const AUTO_FETCH_KEY = 'mondial2026_last_auto_fetch';
+  const AUTO_FETCH_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+  const [autoFetchStatus, setAutoFetchStatus] = useState(null);
+
+  const runAutoFetch = async () => {
+    try {
+      // Check shared last-fetch time across tabs/devices
+      const lastFetchSnap = await fbDB.ref('/_meta/lastAutoFetch').once('value');
+      const lastFetch = lastFetchSnap.val() || 0;
+      const now = Date.now();
+      if (now - lastFetch < AUTO_FETCH_INTERVAL_MS) {
+        console.log('Auto-fetch skipped — last run was', Math.round((now - lastFetch) / 60000), 'minutes ago');
+        return;
+      }
+      // Update last-fetch timestamp FIRST (claim the slot) to prevent races
+      await fbDB.ref('/_meta/lastAutoFetch').set(now);
+      console.log('Running auto-fetch...');
+      const result = await fetchResultsFromAPI();
+      if (result.success && Object.keys(result.results).length > 0) {
+        const data = await cloudGetAll();
+        const merged = { ...data.results, ...result.results };
+        await cloudSetAll(data.submissions, merged);
+        await reload();
+        // Show status only to admin users
+        if (isAdmin) {
+          setAutoFetchStatus(`✓ עודכנו ${result.matched} משחקים אוטומטית`);
+          setTimeout(() => setAutoFetchStatus(null), 8000);
+        }
+      }
+    } catch (e) {
+      console.error('Auto-fetch failed', e);
+    }
+  };
+
+  useEffect(() => {
+    // Run once on load (after small delay to let initial data load)
+    const initialTimer = setTimeout(runAutoFetch, 3000);
+    // Then check every 10 minutes whether an hour has passed since last fetch
+    const interval = setInterval(runAutoFetch, 10 * 60 * 1000);
+    return () => { clearTimeout(initialTimer); clearInterval(interval); };
+  }, []);
+  // ============================================================
+
   const goPredict = () => { setView('predict'); window.scrollTo(0,0); };
   const goHome = () => { reload(); setView('home'); window.scrollTo(0,0); };
   const goList = async () => { setView('list'); window.scrollTo(0,0); await reload(); };
@@ -1731,6 +1808,12 @@ function App() {
 
   return (
     <div dir="rtl" className="min-h-screen bg-black">
+      {/* Auto-fetch status notification (master only) */}
+      {autoFetchStatus && isAdmin && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 bg-green-600 text-white px-5 py-3 rounded-2xl shadow-2xl border-2 border-green-300 flex items-center gap-2 fade-up">
+          <RefreshCw className="w-5 h-5" /> {autoFetchStatus}
+        </div>
+      )}
       {view === 'home' && <HomeView onPredict={goPredict} onView={goList} onLeaderboard={goLeaderboard} onResultsEntry={goResultsEntry} onMatrix={goMatrix} count={users.length} isAdmin={isAdmin} isSuperAdmin={isSuperAdmin} onAdminLogin={()=>setShowLogin(true)} onAdminLogout={()=>{setAdminLocal(false);setIsAdmin(false);setIsSuperAdmin(false);}} refreshing={refreshing} onRefresh={reload} />}
       {view === 'predict' && <PredictView onBack={goHome} onSubmitted={onSubmitted} />}
       {view === 'success' && <SuccessView onHome={goHome} onList={goList} onLeaderboard={goLeaderboard} />}
